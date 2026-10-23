@@ -50,8 +50,13 @@ pub struct WindowsWindowState {
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
+    /// Keep the requested appearance separate from the temporary native
+    /// material used during a modal move/resize on legacy Windows.
+    pub in_size_move: Cell<bool>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
+    pub destroyed: Cell<bool>,
+    pub drop_target_registered: Cell<bool>,
 
     pub callbacks: Callbacks,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
@@ -160,8 +165,11 @@ impl WindowsWindowState {
             border_offset,
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
+            in_size_move: Cell::new(false),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
+            destroyed: Cell::new(false),
+            drop_target_registered: Cell::new(false),
             min_size,
             callbacks,
             input_handler: Cell::new(input_handler),
@@ -370,6 +378,48 @@ impl WindowsWindowInner {
     pub(crate) fn system_settings(&self) -> &WindowsSystemSettings {
         &self.system_settings
     }
+
+    pub(crate) fn set_in_size_move(&self, active: bool) {
+        if self.state.in_size_move.replace(active) != active
+            && self.state.background_appearance.get() == WindowBackgroundAppearance::Blurred
+        {
+            self.apply_background_appearance();
+        }
+    }
+
+    fn apply_background_appearance(&self) {
+        let (accent, backdrop) = backdrop_modes(
+            self.state.background_appearance.get(),
+            self.state.in_size_move.get(),
+        );
+        if backdrop != 1 {
+            // Windows 11 22H2+ has a supported, compositor-owned Acrylic
+            // backdrop. Never leave the legacy accent stacked beneath it.
+            set_window_composition_attribute(self.hwnd, None, 0);
+            if dwm_set_window_composition_attribute(self.hwnd, backdrop) {
+                return;
+            }
+        }
+        // Clear a previous Mica/Acrylic system backdrop when changing to an
+        // accent/opaque appearance, including when the supported API failed.
+        dwm_set_window_composition_attribute(self.hwnd, 1);
+        set_window_composition_attribute(self.hwnd, Some((0, 0, 0, 0)), accent);
+    }
+}
+
+/// (legacy ACCENT_STATE, DWM_SYSTEMBACKDROP_TYPE). Disable is 0 for the
+/// former and 1 for the latter; 0 is AUTO, not disabled, for DWM.
+fn backdrop_modes(appearance: WindowBackgroundAppearance, in_size_move: bool) -> (u32, u32) {
+    match appearance {
+        WindowBackgroundAppearance::Opaque => (0, 1),
+        WindowBackgroundAppearance::Transparent => (2, 1),
+        // Legacy Acrylic stalls moving/resizing on Windows 10 1903+.
+        // Keep blur while moving, then restore Acrylic on exit. On modern
+        // Windows the supported DWM transient-window backdrop stays active.
+        WindowBackgroundAppearance::Blurred => (if in_size_move { 3 } else { 4 }, 3),
+        WindowBackgroundAppearance::MicaBackdrop => (0, 2),
+        WindowBackgroundAppearance::MicaAltBackdrop => (0, 4),
+    }
 }
 
 #[derive(Default)]
@@ -384,6 +434,21 @@ pub(crate) struct Callbacks {
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
     pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
+}
+
+impl Callbacks {
+    pub(crate) fn clear(&self) {
+        self.request_frame.take();
+        self.input.take();
+        self.active_status_change.take();
+        self.hovered_status_change.take();
+        self.resize.take();
+        self.moved.take();
+        self.should_close.take();
+        self.close.take();
+        self.hit_test_window_control.take();
+        self.appearance_changed.take();
+    }
 }
 
 struct WindowCreateContext {
@@ -584,15 +649,32 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
-        // clone this `Rc` to prevent early release of the pointer
+        // Clear all callbacks immediately so late OS messages/deferred tasks
+        // cannot re-enter GPUI after this window has begun dropping.
+        self.0.state.callbacks.clear();
+
+        // If the window was already destroyed natively (e.g. via WM_DESTROY),
+        // OLE was already revoked and the HWND is gone. Do NOT schedule a duplicate
+        // RevokeDragDrop or DestroyWindow.
+        if self.0.state.destroyed.get() {
+            return;
+        }
+
+        // Programmatic destruction initiated from GPUI before WM_DESTROY:
         let this = self.0.clone();
         self.0
             .executor
             .spawn(async move {
                 let handle = this.hwnd;
-                unsafe {
-                    RevokeDragDrop(handle).log_err();
-                    DestroyWindow(handle).log_err();
+                if !this.state.destroyed.replace(true) {
+                    if this.state.drop_target_registered.replace(false) {
+                        unsafe {
+                            RevokeDragDrop(handle).log_err();
+                        }
+                    }
+                    unsafe {
+                        DestroyWindow(handle).log_err();
+                    }
                 }
             })
             .detach();
@@ -869,29 +951,7 @@ impl PlatformWindow for WindowsWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.state.background_appearance.set(background_appearance);
-        let hwnd = self.0.hwnd;
-
-        // using Dwm APIs for Mica and MicaAlt backdrops.
-        // others follow the set_window_composition_attribute approach
-        match background_appearance {
-            WindowBackgroundAppearance::Opaque => {
-                set_window_composition_attribute(hwnd, None, 0);
-            }
-            WindowBackgroundAppearance::Transparent => {
-                set_window_composition_attribute(hwnd, None, 2);
-            }
-            WindowBackgroundAppearance::Blurred => {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
-            }
-            WindowBackgroundAppearance::MicaBackdrop => {
-                // DWMSBT_MAINWINDOW => MicaBase
-                dwm_set_window_composition_attribute(hwnd, 2);
-            }
-            WindowBackgroundAppearance::MicaAltBackdrop => {
-                // DWMSBT_TABBEDWINDOW => MicaAlt
-                dwm_set_window_composition_attribute(hwnd, 4);
-            }
-        }
+        self.0.apply_background_appearance();
     }
 
     fn minimize(&self) {
@@ -1488,6 +1548,7 @@ fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
         RegisterDragDrop(window_handle, &drag_drop_handler)
             .context("unable to register drag-drop event")?;
     }
+    window.state.drop_target_registered.set(true);
     Ok(())
 }
 
@@ -1559,27 +1620,24 @@ fn retrieve_window_placement(
     Ok(placement)
 }
 
-fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
+fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) -> bool {
     let mut version = unsafe { std::mem::zeroed() };
     let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
 
-    // DWMWA_SYSTEMBACKDROP_TYPE is available only on version 22621 or later
-    // using SetWindowCompositionAttributeType as a fallback
+    // DWMWA_SYSTEMBACKDROP_TYPE is available only on version 22621 or later.
+    // Report both unsupported systems and API failures to the accent fallback.
     if !status.is_ok() || version.dwBuildNumber < 22621 {
-        return;
+        return false;
     }
 
     unsafe {
-        let result = DwmSetWindowAttribute(
+        DwmSetWindowAttribute(
             hwnd,
             DWMWA_SYSTEMBACKDROP_TYPE,
             &backdrop_type as *const _ as *const _,
             std::mem::size_of_val(&backdrop_type) as u32,
-        );
-
-        if !result.is_ok() {
-            return;
-        }
+        )
+        .is_ok()
     }
 }
 
@@ -1643,9 +1701,39 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
-    use gpui::{DevicePixels, MouseButton, point};
+    use super::{ClickState, backdrop_modes};
+    use gpui::{DevicePixels, MouseButton, WindowBackgroundAppearance, point};
     use std::time::Duration;
+
+    #[test]
+    fn acrylic_uses_blur_during_legacy_window_movement() {
+        let requested = WindowBackgroundAppearance::Blurred;
+        assert_eq!(backdrop_modes(requested, false), (4, 3));
+        assert_eq!(backdrop_modes(requested, true), (3, 3));
+        assert_eq!(backdrop_modes(requested, false), (4, 3));
+    }
+
+    #[test]
+    fn appearance_changes_during_movement_do_not_restore_stale_acrylic() {
+        for moving in [true, false] {
+            assert_eq!(
+                backdrop_modes(WindowBackgroundAppearance::Opaque, moving),
+                (0, 1)
+            );
+            assert_eq!(
+                backdrop_modes(WindowBackgroundAppearance::Transparent, moving),
+                (2, 1)
+            );
+            assert_eq!(
+                backdrop_modes(WindowBackgroundAppearance::MicaBackdrop, moving),
+                (0, 2)
+            );
+            assert_eq!(
+                backdrop_modes(WindowBackgroundAppearance::MicaAltBackdrop, moving),
+                (0, 4)
+            );
+        }
+    }
 
     #[test]
     fn test_double_click_interval() {
@@ -1694,6 +1782,16 @@ mod tests {
             state.update(MouseButton::Right, point(DevicePixels(10), DevicePixels(0))),
             1
         );
+    }
+
+    #[test]
+    fn callbacks_clear_disarms_all_cells() {
+        let callbacks = super::Callbacks::default();
+        callbacks.close.set(Some(Box::new(|| ())));
+        callbacks.should_close.set(Some(Box::new(|| true)));
+        callbacks.clear();
+        assert!(callbacks.close.take().is_none());
+        assert!(callbacks.should_close.take().is_none());
     }
 }
 

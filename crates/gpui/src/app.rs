@@ -757,6 +757,7 @@ pub struct App {
     pending_updates: usize,
     quit_mode: QuitMode,
     quitting: bool,
+    shutdown_timeout: Duration,
 
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
     // Otherwise it may report false positives.
@@ -841,6 +842,7 @@ impl App {
                 inspector_element_registry: InspectorElementRegistry::default(),
                 quit_mode: QuitMode::default(),
                 quitting: false,
+                shutdown_timeout: SHUTDOWN_TIMEOUT,
                 cursor_hide_mode: CursorHideMode::default(),
                 reduce_motion: false,
                 accessibility_force_disabled: false,
@@ -927,8 +929,15 @@ impl App {
         self.entities.assert_no_new_leaks(snapshot)
     }
 
+    /// Set the bounded time given to application quit handlers. Defaults to
+    /// [`SHUTDOWN_TIMEOUT`]; applications with owned processes or persistent
+    /// stores can allow their asynchronous cleanup to finish before exit.
+    pub fn set_shutdown_timeout(&mut self, timeout: Duration) {
+        self.shutdown_timeout = timeout;
+    }
+
     /// Quit the application gracefully. Handlers registered with [`Context::on_app_quit`]
-    /// will be given `SHUTDOWN_TIMEOUT` to complete before exiting.
+    /// are given the configured shutdown timeout to complete before exiting.
     pub fn shutdown(&mut self) {
         let mut futures = Vec::new();
 
@@ -944,7 +953,7 @@ impl App {
         let futures = futures::future::join_all(futures);
         if self
             .foreground_executor
-            .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
+            .block_with_timeout(self.shutdown_timeout, futures)
             .is_err()
         {
             log::error!("timed out waiting on app_will_quit");
@@ -2925,6 +2934,18 @@ mod test {
     use std::{cell::RefCell, rc::Rc};
 
     use crate::{AppContext, TestAppContext};
+
+    #[test]
+    fn shutdown_budget_is_per_app_and_preserves_the_default() {
+        let cx = TestAppContext::single();
+        cx.update(|cx| {
+            assert_eq!(cx.shutdown_timeout, super::SHUTDOWN_TIMEOUT);
+            cx.set_shutdown_timeout(std::time::Duration::from_secs(30));
+            assert_eq!(cx.shutdown_timeout, std::time::Duration::from_secs(30));
+        });
+        let other = TestAppContext::single();
+        other.update(|cx| assert_eq!(cx.shutdown_timeout, super::SHUTDOWN_TIMEOUT));
+    }
 
     #[test]
     fn test_gpui_borrow() {

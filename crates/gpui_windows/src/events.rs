@@ -6,7 +6,7 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::SystemServices::*,
+        System::{Ole::RevokeDragDrop, SystemServices::*},
         UI::{
             Controls::*,
             HiDpi::*,
@@ -50,8 +50,16 @@ impl WindowsWindowInner {
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
-            WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
-            WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
+            WM_ENTERSIZEMOVE => {
+                self.set_in_size_move(true);
+                self.handle_size_move_loop(handle)
+            }
+            WM_EXITSIZEMOVE => {
+                self.set_in_size_move(false);
+                self.handle_size_move_loop_exit(handle)
+            }
+            WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
+            WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
             WM_TIMER => self.handle_timer_msg(handle, wparam),
             WM_NCCALCSIZE => self.handle_calc_client_size(handle, wparam, lparam),
             WM_DPICHANGED => self.handle_dpi_changed_msg(handle, wparam, lparam),
@@ -272,7 +280,17 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.state.destroyed.set(true);
+        if self.state.drop_target_registered.replace(false) {
+            unsafe {
+                RevokeDragDrop(handle).log_err();
+            }
+        }
+
         let callback = { self.state.callbacks.close.take() };
+        // Clear remaining callbacks so removed GPUI views are never re-entered
+        self.state.callbacks.clear();
+
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
             unsafe {

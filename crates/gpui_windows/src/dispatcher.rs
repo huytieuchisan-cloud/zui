@@ -24,6 +24,7 @@ use crate::{HWND, SafeHwnd, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD};
 use gpui::{
     PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant, TimerResolutionGuard,
 };
+use parking_lot::RwLock;
 
 pub(crate) struct WindowsDispatcher {
     pub(crate) wake_posted: AtomicBool,
@@ -31,6 +32,8 @@ pub(crate) struct WindowsDispatcher {
     main_thread_id: ThreadId,
     pub(crate) platform_window_handle: SafeHwnd,
     validation_number: usize,
+    /// Serialize wake posts against destruction of the platform HWND.
+    shutdown_gate: RwLock<bool>,
 }
 
 impl WindowsDispatcher {
@@ -40,14 +43,40 @@ impl WindowsDispatcher {
         validation_number: usize,
     ) -> Self {
         let main_thread_id = current().id();
-        let platform_window_handle = platform_window_handle.into();
+        let safe_handle = platform_window_handle.into();
 
         WindowsDispatcher {
             main_sender,
             main_thread_id,
-            platform_window_handle,
+            platform_window_handle: safe_handle,
             validation_number,
             wake_posted: AtomicBool::new(false),
+            shutdown_gate: RwLock::new(true),
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let mut gate = self.shutdown_gate.write();
+        *gate = false;
+    }
+
+    pub(crate) fn post_main_thread_wake(&self) {
+        let gate = self.shutdown_gate.read();
+        if *gate {
+            unsafe {
+                if PostMessageW(
+                    Some(self.platform_window_handle.as_raw()),
+                    WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD,
+                    WPARAM(self.validation_number),
+                    LPARAM(0),
+                )
+                .is_err()
+                {
+                    self.wake_posted.store(false, Ordering::Release);
+                }
+            }
+        } else {
+            self.wake_posted.store(false, Ordering::Release);
         }
     }
 
@@ -116,6 +145,14 @@ impl PlatformDispatcher for WindowsDispatcher {
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
+        let gate = self.shutdown_gate.read();
+        if !*gate {
+            // App is shutting down and platform window is destroying.
+            // Runnable may wrap a !Send Future; forget rather than drop on background thread.
+            std::mem::forget(runnable);
+            return;
+        };
+
         match self.main_sender.send(priority, runnable) {
             Ok(_) => {
                 if !self.wake_posted.swap(true, Ordering::AcqRel) {

@@ -1023,16 +1023,7 @@ impl WindowsPlatformInner {
                         process_message(&msg);
                     }
                     // Allow the main loop to process other gpui events before going back into `run_foreground_task`
-                    unsafe {
-                        if let Err(_) = PostMessageW(
-                            Some(self.dispatcher.platform_window_handle.as_raw()),
-                            WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD,
-                            WPARAM(self.validation_number),
-                            LPARAM(0),
-                        ) {
-                            self.dispatcher.wake_posted.store(false, Ordering::Release);
-                        };
-                    }
+                    self.dispatcher.post_main_thread_wake();
                     break 'tasks;
                 }
                 let mut main_receiver = self.main_receiver.clone();
@@ -1105,6 +1096,10 @@ impl WindowsPlatformInner {
 
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
+        // Synchronize and mark dispatcher shut down before destroying the platform window.
+        // This guarantees no worker thread can post to `self.handle` during or after its destruction.
+        self.inner.dispatcher.shutdown();
+
         unsafe {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
                 // SAFETY: notification was returned by RegisterSuspendResumeNotification.
